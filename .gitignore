@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Secrets and environment
+.env
+.env.*
+!.env.example
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+
+# Logs and caches
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model weights and datasets
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+models/
+checkpoints/
+datasets/
+
+# Local configuration and temporary files
+*.tmp
+*.bak

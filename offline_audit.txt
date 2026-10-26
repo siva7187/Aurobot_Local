@@ -1,0 +1,469 @@
+========== OFFLINE AGENT ==========
+   250	                self._on_utterance(audio, time.time())
+   251	
+   252	    # ------------------------------------------------------------------ vision
+   253	    def _start_vision(self) -> None:
+   254	        if self.cfg.vision_source == "none":
+   255	            print("[vision] disabled (AUROBOT_VISION_SOURCE=none)")
+   256	            return
+   257	        import vision_worker
+   258	        os.environ["AUROBOT_VISION_DEVICE"] = self.cfg.vision_device
+   259	        self._vision_q = multiprocessing.Queue()
+   260	        self._vision_proc = multiprocessing.Process(
+   261	            target=vision_worker.run,
+   262	            kwargs=dict(
+   263	                result_queue=self._vision_q,
+   264	                poll_seconds=float(os.environ.get("AUROBOT_VISION_POLL_SECONDS", "2.5")),
+   265	                frame_width=int(os.environ.get("AUROBOT_VISION_FRAME_WIDTH", "320")),
+   266	                source="webcam",
+   267	                detector_backend=os.environ.get("AUROBOT_VISION_DETECTOR", "mtcnn"),
+   268	            ),
+   269	            daemon=True,
+   270	        )
+   271	        self._vision_proc.start()
+   272	
+   273	    def _drain_vision(self) -> None:
+   274	        q = self._vision_q
+   275	        if q is None:
+   276	            return
+   277	        while True:
+   278	            try:
+   279	                item = q.get_nowait()
+   280	            except Exception:
+   281	                break
+   282	            if "error" in item:
+   283	                if item["error"] != self._last_vision_error:
+   284	                    print("[vision] error:", item["error"])
+   285	                    self._last_vision_error = item["error"]
+   286	                continue
+   287	            self.fusion.update_vision(item["emotion_scores"])
+   288	            st = self.fusion.get_state()
+   289	            db_writer.submit(self.memory.log_emotion, st.emotion, st.confidence)
+   290	
+   291	    # ------------------------------------------------------------------ main loop
+   292	    def run(self) -> None:
+   293	        db_writer.start()
+   294	        self._recap = self.memory.conversation_recap(limit=8)
+   295	        self._memory_context = self.store.build_context_block(limit=5)
+   296	
+   297	        self._start_vision()
+   298	        self.speaker.start()
+   299	        self._running = True
+   300	        threading.Thread(target=self._turn_worker, daemon=True, name="turns").start()
+   301	        self.mic.start()
+   302	        threading.Thread(target=self._listen_loop, daemon=True, name="listen").start()
+   303	
+   304	        if self.cfg.greeting:
+   305	            self.submit_turn(Turn("greeting"))
+   306	        print("\n[ready] Aurobot is listening (offline). Ctrl+C to quit.\n")
+   307	
+   308	        try:
+   309	            while True:
+   310	                self._drain_vision()
+   311	                state = self.fusion.get_state()
+   312	                want = self.policy.should_speak(state, self.last_spoken_at)
+   313	                user_talking = bool(self._seg and self._seg.in_speech)
+   314	                busy = (self._turn_active.is_set() or self.speaker.is_speaking or user_talking)
+   315	                if want and not busy and not self.control.is_quiet:
+   316	                    self.last_spoken_at = time.time()      # reserve: prevents double-queueing
+   317	                    self.submit_turn(Turn("proactive", emotion=state.emotion))
+   318	                time.sleep(1)
+   319	        except KeyboardInterrupt:
+   320	            print("\n[shutdown]")
+   321	        finally:
+   322	            self._running = False
+   323	            self._interrupt_all()
+   324	            self.turn_q.put(None)
+   325	            if self._vision_proc is not None:
+   326	                self._vision_proc.terminate()
+   327	            self.mic.stop()
+   328	
+   329	
+   330	# ====================================================================== bootstrap
+   331	def build(cfg: OfflineConfig) -> OfflineAurobot:
+   332	    from offline.audio_io import MicStream, SoundDeviceOut
+   333	    from offline.stt import WhisperSTT
+   334	    from offline.tts import make_tts
+   335	
+   336	    host = urlparse(cfg.ollama_url).hostname
+   337	    if host not in ("127.0.0.1", "localhost", "::1"):
+   338	        print(f"[warn] Ollama URL points to {host}, not this machine — this is not fully offline.")
+   339	
+   340	    t0 = time.time()
+   341	    print("[startup] checking local LLM (Ollama)…")
+   342	    llm = OllamaClient(cfg.ollama_url, cfg.ollama_model, cfg.ollama_num_ctx,
+   343	                       cfg.ollama_keep_alive, cfg.llm_temperature, cfg.llm_max_tokens)
+   344	    llm.check()
+   345	    llm.warmup()
+   346	
+   347	    print(f"[startup] loading speech-to-text ({cfg.stt_model}, {cfg.stt_device})…")
+   348	    stt = WhisperSTT(cfg.stt_model, cfg.stt_device, cfg.stt_compute_type, cfg.stt_threads,
+   349	                     cfg.stt_language, cfg.stt_beam_size, local_only=cfg.strict_offline)
+   350	
+   351	    print("[startup] loading text-to-speech…")
+   352	    tts = make_tts(cfg)
+   353	    print(f"[startup] TTS backend: {tts.backend}")
+   354	
+   355	    speaker = Speaker(tts, SoundDeviceOut(tts.sample_rate, cfg.output_device))
+   356	    print(f"[startup] models ready in {time.time() - t0:.1f}s")
+   357	
+   358	    return OfflineAurobot(
+   359	        cfg, stt=stt, llm=llm, speaker=speaker, mic=MicStream(cfg.input_device),
+   360	        store=MemoryStore(), memory=EmotionMemory(),
+   361	    )
+   362	
+   363	
+   364	def main() -> None:
+   365	    cfg = OfflineConfig.from_env()
+   366	    if cfg.strict_offline:
+   367	        # make accidental network lookups fail loudly instead of silently going online
+   368	        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+   369	        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+   370	    try:
+   371	        bot = build(cfg)
+   372	    except Exception as e:
+   373	        print(f"\n[startup failed] {e}")
+   374	        sys.exit(1)
+   375	    bot.run()
+   376	
+   377	
+   378	if __name__ == "__main__":
+   379	    main()
+========== VISION WORKER ==========
+     1	# vision_worker.py
+     2	"""
+     3	Runs face + emotion detection in a SEPARATE OS PROCESS.
+     4	
+     5	Why a separate process: DeepFace/MTCNN inference is CPU-heavy. Running it as
+     6	a thread in the same process as the LiveKit voice session means it competes
+     7	for the same cores (and the same GIL for pure-Python bookkeeping) as your
+     8	real-time audio pipeline — a common source of audio stutter/lag. A separate
+     9	process gets its own memory space and OS scheduling, so a slow detection
+    10	pass can't directly stall audio.
+    11	
+    12	PLUGGABLE FRAME SOURCE (hardware-deployment groundwork):
+    13	  source="webcam" (default) — cv2.VideoCapture(0), for laptop/dev use.
+    14	  source="remote"           — reads frames from `frame_queue` instead, which
+    15	                               the caller feeds from wherever frames actually
+    16	                               come from (e.g. a LiveKit video track
+    17	                               subscribed to a remote embedded device's
+    18	                               camera). This worker never needs to know
+    19	                               whether the camera is local or on a device
+    20	                               across the room — that decision lives entirely
+    21	                               in agent.py's setup code, not here.
+    22	
+    23	Output communication is one-way, worker -> main, over a multiprocessing.Queue
+    24	of plain dicts (picklable), same as before.
+    25	"""
+    26	
+    27	import os
+    28	import queue
+    29	import time
+    30	
+    31	
+    32	def _process_frame(frame, frame_width, detector_backend, cv2_module):
+    33	    h, w = frame.shape[:2]
+    34	    if w > frame_width:
+    35	        scale = frame_width / w
+    36	        frame = cv2_module.resize(frame, (frame_width, int(h * scale)))
+    37	    return cv2_module.cvtColor(frame, cv2_module.COLOR_BGR2RGB)
+    38	
+    39	
+    40	def run(
+    41	    result_queue,
+    42	    poll_seconds: float = 2.5,
+    43	    frame_width: int = 320,
+    44	    source: str = "webcam",
+    45	    frame_queue=None,          # required when source == "remote"
+    46	    detector_backend: str = "mtcnn",
+    47	) -> None:
+    48	    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    49	    os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+    50	
+    51	    # Opt-in: pin THIS process to CPU so the GPU's VRAM stays free (offline mode
+    52	    # gives it to the local LLM). Only affects this child process, and must be set
+    53	    # before TensorFlow is imported. Default ("auto") leaves behaviour unchanged.
+    54	    if os.environ.get("AUROBOT_VISION_DEVICE", "auto").lower() == "cpu":
+    55	        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+    56	
+    57	    # GPU setup MUST happen before any TensorFlow op runs (including DeepFace's
+    58	    # import-time model construction) — memory growth can't be changed once a
+    59	    # GPU has been initialized. Without this, TensorFlow grabs ALL VRAM upfront
+    60	    # by default, which can itself cause a noticeable stall on first inference
+    61	    # and can starve anything else on the GPU.
+    62	    import tensorflow as tf
+    63	    gpus = tf.config.list_physical_devices("GPU")
+    64	    if gpus:
+    65	        try:
+    66	            for gpu in gpus:
+    67	                tf.config.experimental.set_memory_growth(gpu, True)
+    68	            print(f"[vision_worker] GPU acceleration enabled: {[g.name for g in gpus]}")
+    69	        except RuntimeError as e:
+    70	            print(f"[vision_worker] GPU found but memory-growth config failed: {e}")
+    71	    else:
+    72	        print("[vision_worker] No GPU visible to TensorFlow — running vision on CPU")
+    73	
+    74	    import cv2
+    75	    from deepface import DeepFace
+    76	
+    77	    cap = None
+    78	    if source == "webcam":
+    79	        cap = cv2.VideoCapture(0)
+    80	        if not cap.isOpened():
+    81	            result_queue.put({"error": "camera_not_accessible"})
+    82	            return
+    83	    elif source == "remote":
+    84	        if frame_queue is None:
+    85	            result_queue.put({"error": "remote source selected but no frame_queue provided"})
+    86	            return
+    87	    else:
+    88	        result_queue.put({"error": f"unknown vision source: {source}"})
+    89	        return
+    90	
+    91	    last_error = None
+    92	
+    93	    while True:
+    94	        if source == "webcam":
+    95	            ret, frame = cap.read()
+    96	            if not ret:
+    97	                continue
+    98	        else:  # remote
+    99	            try:
+   100	                frame = frame_queue.get(timeout=poll_seconds * 2)
+   101	            except queue.Empty:
+   102	                continue  # no frame arrived from the remote device recently — just wait again
+   103	
+   104	        try:
+   105	            rgb_frame = _process_frame(frame, frame_width, detector_backend, cv2)
+   106	
+   107	            t0 = time.time()
+   108	            result = DeepFace.analyze(
+   109	                rgb_frame,
+   110	                actions=["emotion"],
+   111	                enforce_detection=False,
+   112	                detector_backend=detector_backend,
+   113	            )
+   114	            analyze_ms = (time.time() - t0) * 1000
+   115	
+   116	            emotion_scores = result[0]["emotion"]
+   117	            result_queue.put({"emotion_scores": emotion_scores, "analyze_ms": analyze_ms})
+   118	            last_error = None
+   119	
+   120	        except Exception as e:
+   121	            if str(e) != last_error:
+   122	                result_queue.put({"error": str(e)})
+   123	                last_error = str(e)
+   124	
+   125	        if source == "webcam":
+   126	            time.sleep(poll_seconds)
+   127	        # for "remote", pacing is naturally set by how often frames arrive in frame_queue
+========== MODEL PREFETCH ==========
+     1	#!/usr/bin/env python3
+     2	"""
+     3	One-time setup: download every model Aurobot needs, WHILE YOU HAVE INTERNET.
+     4	After this, offline mode never touches the network.
+     5	
+     6	    python scripts/prefetch_models.py            # download everything
+     7	    python scripts/prefetch_models.py --check    # verify everything is present (works offline)
+     8	
+     9	Downloads:
+    10	  1. faster-whisper speech model        (~460 MB for "small")
+    11	  2. Piper voice (.onnx + .json)        (~65 MB)
+    12	  3. DeepFace emotion weights           (~6 MB, plus MTCNN which ships in the pip package)
+    13	  4. Ollama LLM                         (~1.9 GB for qwen2.5:3b)  via `ollama pull`
+    14	"""
+    15	import argparse
+    16	import glob
+    17	import os
+    18	import shutil
+    19	import subprocess
+    20	import sys
+    21	import urllib.request
+    22	
+    23	ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    24	sys.path.insert(0, ROOT)
+    25	from offline.config import OfflineConfig  # noqa: E402
+    26	
+    27	PIPER_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/"
+    28	PIPER_FILES = ["en_US-lessac-medium.onnx", "en_US-lessac-medium.onnx.json"]
+    29	
+    30	cfg = OfflineConfig.from_env()
+    31	
+    32	
+    33	def say(ok, msg):
+    34	    print(("  [ok]   " if ok else "  [FAIL] ") + msg)
+    35	    return ok
+    36	
+    37	
+    38	def whisper(check):
+    39	    try:
+    40	        from faster_whisper import WhisperModel
+    41	        WhisperModel(cfg.stt_model, device="cpu", compute_type="int8", local_files_only=check)
+    42	        return say(True, f"speech model '{cfg.stt_model}'")
+    43	    except Exception as e:
+    44	        return say(False, f"speech model '{cfg.stt_model}': {e}")
+    45	
+    46	
+    47	def piper(check):
+    48	    voice_dir = os.path.dirname(os.path.join(ROOT, cfg.piper_voice)) or "."
+    49	    os.makedirs(voice_dir, exist_ok=True)
+    50	    ok = True
+    51	    for name in PIPER_FILES:
+    52	        dest = os.path.join(voice_dir, name)
+    53	        if os.path.exists(dest):
+    54	            say(True, f"piper voice file {name}")
+    55	            continue
+    56	        if check:
+    57	            ok = say(False, f"piper voice file missing: {dest}")
+    58	            continue
+    59	        try:
+    60	            print(f"  downloading {name} …")
+    61	            urllib.request.urlretrieve(PIPER_BASE + name, dest)
+    62	            say(True, f"piper voice file {name}")
+    63	        except Exception as e:
+    64	            ok = say(False, f"{name}: {e}  (check the URL at huggingface.co/rhasspy/piper-voices)")
+    65	    return ok
+    66	
+    67	
+    68	def deepface(check):
+    69	    import importlib.util
+    70	    if cfg.vision_source == "none" or importlib.util.find_spec("deepface") is None:
+    71	        say(True, "DeepFace emotion weights — skipped (vision off / not installed)")
+    72	        return True
+    73	    pattern = os.path.expanduser("~/.deepface/weights/*expression*")
+    74	    if check:
+    75	        return say(bool(glob.glob(pattern)), "DeepFace emotion weights")
+    76	    try:
+    77	        import numpy as np
+    78	        from deepface import DeepFace
+    79	        DeepFace.analyze(np.zeros((224, 224, 3), dtype=np.uint8), actions=["emotion"],
+    80	                         enforce_detection=False, detector_backend="mtcnn")
+    81	        return say(True, "DeepFace emotion weights")
+    82	    except Exception as e:
+    83	        return say(False, f"DeepFace: {e}")
+    84	
+    85	
+    86	def ollama(check):
+    87	    from offline.llm import OllamaClient, OllamaError
+    88	    client = OllamaClient(cfg.ollama_url, cfg.ollama_model)
+    89	    try:
+    90	        client.check()
+    91	        return say(True, f"Ollama model '{cfg.ollama_model}'")
+    92	    except OllamaError as e:
+    93	        if check:
+    94	            return say(False, str(e).splitlines()[0] + "  → " + (str(e).splitlines() or [""])[-1])
+    95	    if not shutil.which("ollama"):
+    96	        return say(False, "ollama not installed — see https://ollama.com/download (Linux: curl -fsSL https://ollama.com/install.sh | sh)")
+    97	    print(f"  pulling {cfg.ollama_model} …")
+    98	    rc = subprocess.call(["ollama", "pull", cfg.ollama_model])
+    99	    return say(rc == 0, f"Ollama model '{cfg.ollama_model}'")
+   100	
+   101	
+   102	def espeak(_check):
+   103	    return say(bool(shutil.which("espeak-ng")), "espeak-ng (optional fallback voice; sudo apt install espeak-ng)")
+   104	
+   105	
+   106	if __name__ == "__main__":
+   107	    ap = argparse.ArgumentParser()
+   108	    ap.add_argument("--check", action="store_true", help="verify only; no downloads")
+   109	    args = ap.parse_args()
+   110	    print("== Aurobot offline assets ==" + ("  (check only)" if args.check else ""))
+   111	    results = [whisper(args.check), piper(args.check), deepface(args.check), ollama(args.check)]
+   112	    espeak(args.check)
+   113	    print("\nAll required assets present — safe to go offline." if all(results)
+   114	          else "\nSome required assets are missing (see [FAIL] above).")
+   115	    sys.exit(0 if all(results) else 1)
+========== OFFLINE SETUP ==========
+     1	#!/usr/bin/env bash
+     2	# setup_offline.sh — creates a SEPARATE virtual environment for offline mode.
+     3	#
+     4	#   ./setup_offline.sh                 # core + vision deps
+     5	#   ./setup_offline.sh --no-vision     # skip TensorFlow/DeepFace (no emotion camera; much smaller)
+     6	#   ./setup_offline.sh --prefetch      # also download all models right away (needs internet)
+     7	#
+     8	# Env:  AUROBOT_OFFLINE_ENV=<dir>   (default: venv_offline)    PYTHON=<interpreter> (default: python3)
+     9	set -e
+    10	cd "$(dirname "$0")"
+    11	
+    12	ENV_DIR="${AUROBOT_OFFLINE_ENV:-venv_offline}"
+    13	PY="${PYTHON:-python3}"
+    14	WITH_VISION=1
+    15	PREFETCH=0
+    16	for arg in "$@"; do
+    17	  case "$arg" in
+    18	    --no-vision) WITH_VISION=0 ;;
+    19	    --prefetch)  PREFETCH=1 ;;
+    20	    *) echo "Unknown option: $arg"; echo "Usage: ./setup_offline.sh [--no-vision] [--prefetch]"; exit 1 ;;
+    21	  esac
+    22	done
+    23	
+    24	echo "== Aurobot offline environment =="
+    25	
+    26	# --- Python version (TensorFlow/CTranslate2 wheels need 3.10-3.13) ---
+    27	ver=$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+    28	minor=${ver#*.}
+    29	if [ "${ver%%.*}" != "3" ] || [ "$minor" -lt 10 ] || [ "$minor" -gt 13 ]; then
+    30	  echo "Python $ver is not supported (need 3.10 - 3.13). Try:  PYTHON=python3.12 ./setup_offline.sh"
+    31	  exit 1
+    32	fi
+    33	echo "-> Using Python $ver ($("$PY" -c 'import sys; print(sys.executable)'))"
+    34	
+    35	# --- create the separate venv ---
+    36	if [ ! -x "$ENV_DIR/bin/python" ]; then
+    37	  echo "-> Creating $ENV_DIR/ …"
+    38	  "$PY" -m venv "$ENV_DIR" || { echo "venv creation failed. On Debian/Ubuntu:  sudo apt install python3-venv python3-full"; exit 1; }
+    39	else
+    40	  echo "-> $ENV_DIR/ already exists — reusing it."
+    41	fi
+    42	VPY="$ENV_DIR/bin/python"     # always call the venv's python directly: no activation, no PATH surprises
+    43	
+    44	echo "-> Upgrading pip …"
+    45	"$VPY" -m pip install --quiet --upgrade pip
+    46	
+    47	echo "-> Installing core offline packages …"
+    48	"$VPY" -m pip install -r requirements-offline.txt
+    49	
+    50	if [ "$WITH_VISION" = "1" ]; then
+    51	  echo "-> Installing vision packages (TensorFlow/DeepFace — several minutes, ~1 GB) …"
+    52	  "$VPY" -m pip install -r requirements-vision.txt
+    53	else
+    54	  echo "-> Skipping vision packages (--no-vision). run_offline.sh will start with the camera off."
+    55	fi
+    56	
+    57	# --- system dependencies pip can't install: report, don't fail ---
+    58	echo "-> Checking system pieces …"
+    59	"$VPY" -c "import sounddevice" 2>/dev/null \
+    60	  && echo "   [ok]   PortAudio (microphone/speaker)" \
+    61	  || echo "   [MISSING] PortAudio →  sudo apt install portaudio19-dev libportaudio2"
+    62	command -v espeak-ng >/dev/null \
+    63	  && echo "   [ok]   espeak-ng (fallback voice)" \
+    64	  || echo "   [optional] espeak-ng →  sudo apt install espeak-ng"
+    65	command -v ollama >/dev/null \
+    66	  && echo "   [ok]   ollama" \
+    67	  || echo "   [MISSING] Ollama (local LLM) →  curl -fsSL https://ollama.com/install.sh | sh"
+    68	
+    69	if [ "$PREFETCH" = "1" ]; then
+    70	  echo "-> Downloading models (needs internet) …"
+    71	  "$VPY" scripts/prefetch_models.py
+    72	fi
+    73	
+    74	echo
+    75	echo "Done. Next:"
+    76	[ "$PREFETCH" = "1" ] || echo "  1) (online, once)  $VPY scripts/prefetch_models.py"
+    77	echo "  2) ./run_offline.sh"
+========== ONLINE REFERENCES ==========
+agent_offline.py:2:agent_offline.py — Aurobot running 100% locally. No LiveKit, no Gemini, no internet.
+offline/config.py:41:    ollama_url: str = "http://127.0.0.1:11434"
+offline/llm.py:3:Local LLM via Ollama's HTTP API (http://127.0.0.1:11434), plus the piece that
+offline/llm.py:41:            r = requests.get(f"{self.base}/api/tags", timeout=3)
+offline/llm.py:59:            requests.post(
+offline/llm.py:83:        with requests.post(f"{self.base}/api/chat", json=payload,
+offline/user_control.py:6:to import LiveKit. Two refinements for voice input:
+offline/vad.py:5:Replaces what LiveKit/Gemini did server-side (deciding when you've finished
+vision_worker.py:6:a thread in the same process as the LiveKit voice session means it competes
+vision_worker.py:16:                               come from (e.g. a LiveKit video track
+scripts/prefetch_models.py:21:import urllib.request
+scripts/prefetch_models.py:27:PIPER_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/"
+scripts/prefetch_models.py:61:            urllib.request.urlretrieve(PIPER_BASE + name, dest)
+scripts/prefetch_models.py:96:        return say(False, "ollama not installed — see https://ollama.com/download (Linux: curl -fsSL https://ollama.com/install.sh | sh)")
+setup_offline.sh:67:  || echo "   [MISSING] Ollama (local LLM) →  curl -fsSL https://ollama.com/install.sh | sh"

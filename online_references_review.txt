@@ -1,0 +1,56 @@
+./.env.local.example:1:LIVEKIT_API_KEY="your_livekit_api_key"
+./.env.local.example:2:LIVEKIT_API_SECRET="your_livekit_api_secret"
+./.env.local.example:3:LIVEKIT_URL="wss://your-project.livekit.cloud"
+./.env.local.example:4:NEXT_PUBLIC_LIVEKIT_URL="wss://your-project.livekit.cloud"
+./agent.py:11:for noisy_logger in ("livekit", "livekit.agents", "livekit.plugins.google", "tensorflow"):
+./agent.py:20:from google.genai import types as genai_types
+./agent.py:21:from livekit import agents, rtc
+./agent.py:22:from livekit.agents import AgentServer, AgentSession, Agent, room_io
+./agent.py:23:from livekit.plugins import google, noise_cancellation
+./agent.py:67:# Gemini Live accumulates ~25 audio tokens/sec of conversation in its session context.
+./agent.py:69:# this is a documented server-side Gemini behavior, not something local optimization can
+./agent.py:70:# fix. A sliding-window compression tells Gemini to summarize/drop older turns once the
+./agent.py:73:# — that's a separate, independently-persisted system; this only bounds Gemini's internal
+./agent.py:111:def drain_remote_video_track(video_track_queue, worker_frame_queue) -> None:
+./agent.py:127:            worker_frame_queue.put_nowait(latest)
+./agent.py:135:    event. livekit-agents' event shape has shifted across versions, so this
+./agent.py:304:        worker_frame_queue = multiprocessing.Queue(maxsize=2) if VISION_SOURCE == "remote" else None
+./agent.py:313:                frame_queue=worker_frame_queue,
+./agent.py:336:            drain_remote_video_track(video_track_queue, worker_frame_queue)
+./agent_legacy.py:2:from livekit import agents, rtc
+./agent_legacy.py:3:from livekit.agents import AgentServer, AgentSession, Agent, room_io
+./agent_legacy.py:4:from livekit.plugins import google, noise_cancellation
+./agent_offline.py:2:agent_offline.py — Aurobot running 100% locally. No LiveKit, no Gemini, no internet.
+./agent_offline.py.backup-20261021-124708:2:agent_offline.py — Aurobot running 100% locally. No LiveKit, no Gemini, no internet.
+./memory_store.py:11:persisted here — that's just Python variables in agent.py, cleared each run.
+./offline/user_control.py:5:Same behaviour as the online agent.py, extracted so offline mode doesn't have
+./offline/vad.py:5:Replaces what LiveKit/Gemini did server-side (deciding when you've finished
+./policy.py:6:agent.py with a few simple, explainable rules. Not machine-learned — the
+./README.md:4:Google Gemini Realtime, with webcam-based emotion perception feeding a fusion
+./README.md:18:                                ├─> Fusion engine ─> Policy engine ─> Dialogue agent (LiveKit + Gemini) ─> Voice reply
+./README.md:35:- **`agent.py`** — wires all of the above into a LiveKit `AgentSession`. This
+./README.md:37:- **`agent_legacy.py`** / **`stable_legacy.py`** — the original two variants
+./README.md:55:python agent.py
+./README.md:61:which expects RGB. `agent.py`'s `vision_perception_loop()` now converts
+./README_OFFLINE.md:4:The online version (`agent.py`, LiveKit + Gemini) is untouched and still works.
+./README_OFFLINE.md:15:It contains no LiveKit or Gemini packages, so the two modes can't interfere with each other.
+./README_OFFLINE.md:22:| Run | `python agent.py console` | `./run_offline.sh` |
+./README_OFFLINE.md:70:* **Quality:** a 3B local model is clearly weaker than Gemini — shorter, simpler, more mistakes.
+./README_OFFLINE.md:71:* **No emotion-in-voice:** Gemini hears tone directly; this pipeline only sees transcribed words
+./requirements-offline.txt:1:# OFFLINE environment — core (speech + LLM client). Self-contained: NO LiveKit / Gemini packages.
+./requirements.txt:2:livekit-agents
+./requirements.txt:3:livekit-plugins-google
+./requirements.txt:4:livekit-plugins-noise-cancellation
+./requirements.txt:24:# (livekit-agents' API has moved fast — check against the version you develop against).
+./setup_and_run.sh:64:python agent.py download-files
+./setup_and_run.sh:68:python agent.py console
+./stable_legacy.py:2:from livekit import agents, rtc
+./stable_legacy.py:3:from livekit.agents import AgentServer, AgentSession, Agent, room_io
+./stable_legacy.py:4:from livekit.plugins import google, noise_cancellation
+./vision_worker.py:14:  source="remote"           — reads frames from `frame_queue` instead, which
+./vision_worker.py:21:                               in agent.py's setup code, not here.
+./vision_worker.py:45:    frame_queue=None,          # required when source == "remote"
+./vision_worker.py:84:        if frame_queue is None:
+./vision_worker.py:85:            result_queue.put({"error": "remote source selected but no frame_queue provided"})
+./vision_worker.py:100:                frame = frame_queue.get(timeout=poll_seconds * 2)
+./vision_worker.py:127:        # for "remote", pacing is naturally set by how often frames arrive in frame_queue

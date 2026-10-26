@@ -1,0 +1,14 @@
+# OFFLINE environment — emotion-from-camera (optional).
+# Skipped by:  ./setup_offline.sh --no-vision      (then offline mode runs with vision off)
+
+opencv-python>=4.5.5.64
+deepface
+tensorflow
+tf-keras                # DeepFace's RetinaFace backend needs the Keras-2 API on TF >= 2.16
+mtcnn>=0.1.0
+retina-face>=0.0.14
+pandas>=0.23.4
+Pillow>=5.2.0
+gdown>=3.10.1
+tqdm>=4.30.0
+fire>=0.4.0

@@ -1,0 +1,417 @@
+"""
+agent_offline.py — Aurobot local agent using local Ollama, STT, TTS, and optional webcam vision.
+
+    mic → VAD → faster-whisper → Ollama (streaming) → sentence splitter → Piper → speaker
+                                      ↑
+          emotion (DeepFace, separate process) · memory (SQLite) · proactive policy
+
+Reused unchanged from the online version: fusion.py, policy.py, memory.py,
+memory_store.py, db_writer.py, prompt.py, vision_worker.py.
+
+Threads (plain threads, no asyncio — simpler to reason about and to port to
+small hardware):
+    listener  : mic frames → VAD → STT → queues a Turn
+    worker    : runs one Turn at a time (LLM stream → speaker)
+    speaker   : synth thread + playback thread (see offline/speaker.py)
+    main      : vision draining + proactive scheduling
+
+Run:   python agent_offline.py
+"""
+import os
+import queue
+import sys
+import threading
+import time
+import multiprocessing
+from dataclasses import dataclass
+from typing import Optional
+from urllib.parse import urlparse
+
+from offline.config import OfflineConfig
+from offline.llm import OllamaClient, iter_sentences
+from offline.speaker import Speaker
+from offline.user_control import UserControl
+from offline.vad import FrameVAD, UtteranceSegmenter
+
+from prompt import (
+    AGENT_INSTRUCTION,
+    AGENT_RESPONSE,
+    EMOTION_BEHAVIOR,
+    FINAL_PROMPT_TEMPLATE,
+    OPENING_GREETING_TEMPLATE,
+)
+from fusion import FusionEngine
+from memory import EmotionMemory
+from memory_store import MemoryStore
+from policy import ProactivityPolicy
+import db_writer
+
+VOICE_RULES = (
+    "You are speaking out loud through a speaker. Reply in 1-3 short, natural "
+    "sentences. No lists, no markdown, no emojis, no stage directions."
+)
+SILENT_TOKEN = "[SILENT]"
+FALLBACK_LINE = "Sorry Siva, I had trouble thinking about that. Could you say it again?"
+
+
+@dataclass
+class Turn:
+    kind: str                      # "user" | "proactive" | "greeting"
+    text: str = ""
+    t_speech_end: float = 0.0
+    t_stt_done: float = 0.0
+    emotion: str = "neutral"
+
+
+class OfflineAurobot:
+    def __init__(self, cfg: OfflineConfig, *, stt, llm: OllamaClient, speaker: Speaker,
+                 mic=None, store: MemoryStore, memory: EmotionMemory,
+                 fusion: Optional[FusionEngine] = None,
+                 policy: Optional[ProactivityPolicy] = None):
+        self.cfg = cfg
+        self.stt = stt
+        self.llm = llm
+        self.speaker = speaker
+        self.mic = mic
+        self.store = store
+        self.memory = memory
+        self.fusion = fusion or FusionEngine()
+        self.policy = policy or ProactivityPolicy()
+        self.control = UserControl(store, db_writer.submit)
+
+        self.history: list = []                 # bounded chat history (see _trim_history)
+        self.turn_q: "queue.Queue[Optional[Turn]]" = queue.Queue()
+        self._cancel = threading.Event()
+        self._turn_active = threading.Event()
+        self._running = False
+        self._seg: Optional[UtteranceSegmenter] = None
+
+        self.last_spoken_at = 0.0
+        self._memory_context = ""
+        self._recap = ""
+        self._vision_q = None
+        self._vision_proc = None
+        self._last_vision_error = None
+
+    # ------------------------------------------------------------------ prompts
+    def _system_prompt(self) -> str:
+        parts = [AGENT_INSTRUCTION.strip(), VOICE_RULES]
+        if self._memory_context:
+            parts.append("What you remember about Siva:\n" + self._memory_context)
+        return "\n\n".join(parts)
+
+    def _recap_section(self) -> str:
+        if self._recap:
+            return f"Here's a short recap of your last conversation:\n{self._recap}"
+        return "This is your first conversation with Siva — no prior history yet."
+
+    def _emotion_hint(self) -> str:
+        st = self.fusion.get_state()
+        if st.confidence >= 0.5 and st.emotion != "neutral":
+            return f"Context (don't mention unless relevant): Siva currently looks {st.emotion}."
+        return ""
+
+    def _build_messages(self, turn: Turn) -> list:
+        msgs = [{"role": "system", "content": self._system_prompt()}]
+        msgs += self.history[-self.cfg.max_history_messages:]
+
+        if turn.kind == "user":
+            content = turn.text
+            hint = self._emotion_hint()
+            if hint:
+                content += f"\n\n[{hint}]"
+        elif turn.kind == "greeting":
+            content = OPENING_GREETING_TEMPLATE.format(
+                base_instruction=AGENT_INSTRUCTION, recap_section=self._recap_section())
+        else:  # proactive check-in
+            behavior = EMOTION_BEHAVIOR.get(turn.emotion, EMOTION_BEHAVIOR["neutral"])
+            content = FINAL_PROMPT_TEMPLATE.format(
+                base_instruction=AGENT_INSTRUCTION, emotion=turn.emotion,
+                behavior=behavior, response_style=AGENT_RESPONSE,
+            ) + (f"\nReply with one or two short spoken sentences. "
+                 f"If no check-in is warranted right now, reply exactly {SILENT_TOKEN}.")
+        msgs.append({"role": "user", "content": content})
+        return msgs
+
+    def _trim_history(self) -> None:
+        # BOUNDED history is what keeps latency flat in long sessions.
+        self.history = self.history[-self.cfg.max_history_messages:]
+        while self.history and self.history[0]["role"] != "user":
+            self.history.pop(0)
+
+    # ------------------------------------------------------------------ turns
+    def submit_turn(self, turn: Turn) -> None:
+        self._turn_active.set()
+        self.turn_q.put(turn)
+
+    def _interrupt_all(self) -> None:
+        self._cancel.set()
+        self.speaker.interrupt()
+
+    def _run_turn(self, turn: Turn) -> None:
+        cancel = self._cancel = threading.Event()
+        messages = self._build_messages(turn)
+
+        t_start = time.time()
+        marks = {"first_sentence": None, "first_audio": None}
+        self.speaker.arm_first_audio(lambda ts: marks.__setitem__("first_audio", ts))
+
+        spoken, silent = [], False
+        token_stream = self.llm.stream_chat(messages, cancel)
+        sentences = iter_sentences(token_stream)
+        try:
+            for sent in sentences:
+                if cancel.is_set():
+                    break
+                if turn.kind == "proactive" and not spoken and "SILENT" in sent.upper()[:12]:
+                    silent = True
+                    break
+                if marks["first_sentence"] is None:
+                    marks["first_sentence"] = time.time()
+                self.speaker.say(sent)
+                spoken.append(sent)
+        except Exception as e:
+            print(f"[llm] error: {e}")
+            if not spoken and turn.kind == "user" and not cancel.is_set():
+                self.speaker.say(FALLBACK_LINE)
+        finally:
+            sentences.close()
+            token_stream.close()
+
+        self.speaker.wait_idle(timeout=90)
+
+        if silent or not spoken:
+            return
+        reply = " ".join(spoken)
+        print(f"aurobot> {reply}")
+        if turn.kind == "user":
+            self.history.append({"role": "user", "content": turn.text})
+        self.history.append({"role": "assistant", "content": reply})
+        self._trim_history()
+
+        db_writer.submit(self.memory.log_conversation_turn, "assistant", reply)
+        db_writer.submit(self.memory.log_spoken, turn.emotion if turn.kind == "proactive" else turn.kind)
+        self.last_spoken_at = time.time()   # no proactive check-in right after any reply
+
+        if turn.kind == "user" and marks["first_audio"] and marks["first_sentence"]:
+            print("[latency] stt=%.2fs  llm→1st sentence=%.2fs  speech-end→audio=%.2fs" % (
+                turn.t_stt_done - turn.t_speech_end,
+                marks["first_sentence"] - t_start,
+                marks["first_audio"] - turn.t_speech_end))
+
+    def _turn_worker(self) -> None:
+        while True:
+            turn = self.turn_q.get()
+            if turn is None:
+                return
+            try:
+                self._run_turn(turn)
+            except Exception as e:
+                print(f"[turn] error: {e}")
+            finally:
+                if self.turn_q.empty():
+                    self._turn_active.clear()
+
+    # ------------------------------------------------------------------ listening
+    def _on_utterance(
+        self, audio, t_end: float, interruption_candidate: bool = False
+    ) -> None:
+        text = self.stt.transcribe(audio)
+        t_stt = time.time()
+        if not text:
+            return
+
+        print(f"you> {text}")
+
+        # During playback, only an explicitly recognized quiet command
+        # is allowed to interrupt. Ignore other speech/noise candidates.
+        if interruption_candidate:
+            if not self.control.is_quiet_command(text):
+                print("[barge-in] ignored: not an approved interruption command")
+                return
+
+            db_writer.submit(self.memory.log_conversation_turn, "user", text)
+            self._interrupt_all()
+            self.control.handle(text)
+            self.speaker.say("Okay Siva, I'll stop.")
+            self.last_spoken_at = time.time()
+            return
+
+        db_writer.submit(self.memory.log_conversation_turn, "user", text)
+
+        self._interrupt_all()
+        if self.control.handle(text) == "quiet":
+            self.speaker.say("Okay Siva, I'll stay quiet.")
+            self.last_spoken_at = time.time()
+            return
+
+        self.submit_turn(Turn("user", text, t_speech_end=t_end, t_stt_done=t_stt))
+
+    def _listen_loop(self) -> None:
+        cfg = self.cfg
+        seg = self._seg = UtteranceSegmenter(
+            FrameVAD(cfg.vad_aggressiveness), cfg.end_silence_ms,
+            cfg.min_speech_ms, cfg.max_utterance_s)
+        tail = cfg.echo_tail_ms / 1000.0
+        interruption_candidate = False
+
+        while self._running:
+            frame = self.mic.get(0.5)
+            if frame is None:
+                continue
+
+            speaking = (
+                self.speaker.is_speaking
+                or time.time() - self.speaker.last_audio_end < tail
+            )
+
+            if speaking and not cfg.barge_in:
+                seg.reset()
+                interruption_candidate = False
+                continue
+
+            audio = seg.feed(frame)
+
+            # Record that a segment began while Aurobot was speaking.
+            # Do not cancel anything until local STT confirms a command.
+            if speaking and cfg.barge_in and seg.in_speech:
+                interruption_candidate = True
+
+            if audio is not None:
+                candidate = interruption_candidate
+                interruption_candidate = False
+                self._on_utterance(
+                    audio, time.time(),
+                    interruption_candidate=candidate
+                )
+
+    # ------------------------------------------------------------------ vision
+    def _start_vision(self) -> None:
+        if self.cfg.vision_source == "none":
+            print("[vision] disabled (AUROBOT_VISION_SOURCE=none)")
+            return
+        import vision_worker
+        os.environ["AUROBOT_VISION_DEVICE"] = self.cfg.vision_device
+        self._vision_q = multiprocessing.Queue()
+        self._vision_proc = multiprocessing.Process(
+            target=vision_worker.run,
+            kwargs=dict(
+                result_queue=self._vision_q,
+                poll_seconds=float(os.environ.get("AUROBOT_VISION_POLL_SECONDS", "2.5")),
+                frame_width=int(os.environ.get("AUROBOT_VISION_FRAME_WIDTH", "320")),
+                source="webcam",
+                detector_backend=os.environ.get("AUROBOT_VISION_DETECTOR", "mtcnn"),
+            ),
+            daemon=True,
+        )
+        self._vision_proc.start()
+
+    def _drain_vision(self) -> None:
+        q = self._vision_q
+        if q is None:
+            return
+        while True:
+            try:
+                item = q.get_nowait()
+            except Exception:
+                break
+            if "error" in item:
+                if item["error"] != self._last_vision_error:
+                    print("[vision] error:", item["error"])
+                    self._last_vision_error = item["error"]
+                continue
+            self.fusion.update_vision(item["emotion_scores"])
+            st = self.fusion.get_state()
+            db_writer.submit(self.memory.log_emotion, st.emotion, st.confidence)
+
+    # ------------------------------------------------------------------ main loop
+    def run(self) -> None:
+        db_writer.start()
+        self._recap = self.memory.conversation_recap(limit=8)
+        self._memory_context = self.store.build_context_block(limit=5)
+
+        self._start_vision()
+        self.speaker.start()
+        self._running = True
+        threading.Thread(target=self._turn_worker, daemon=True, name="turns").start()
+        self.mic.start()
+        threading.Thread(target=self._listen_loop, daemon=True, name="listen").start()
+
+        if self.cfg.greeting:
+            self.submit_turn(Turn("greeting"))
+        print("\n[ready] Aurobot is listening (offline). Ctrl+C to quit.\n")
+
+        try:
+            while True:
+                self._drain_vision()
+                state = self.fusion.get_state()
+                want = self.policy.should_speak(state, self.last_spoken_at)
+                user_talking = bool(self._seg and self._seg.in_speech)
+                busy = (self._turn_active.is_set() or self.speaker.is_speaking or user_talking)
+                if want and not busy and not self.control.is_quiet:
+                    self.last_spoken_at = time.time()      # reserve: prevents double-queueing
+                    self.submit_turn(Turn("proactive", emotion=state.emotion))
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n[shutdown]")
+        finally:
+            self._running = False
+            self._interrupt_all()
+            self.turn_q.put(None)
+            if self._vision_proc is not None:
+                self._vision_proc.terminate()
+            self.mic.stop()
+
+
+# ====================================================================== bootstrap
+def build(cfg: OfflineConfig) -> OfflineAurobot:
+    from offline.audio_io import MicStream, SoundDeviceOut
+    from offline.stt import WhisperSTT
+    from offline.tts import make_tts
+
+    host = urlparse(cfg.ollama_url).hostname
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        raise ValueError(
+            f"Strict offline mode requires local Ollama. "
+        )
+
+    t0 = time.time()
+    print("[startup] checking local LLM (Ollama)…")
+    llm = OllamaClient(cfg.ollama_url, cfg.ollama_model, cfg.ollama_num_ctx,
+                       cfg.ollama_keep_alive, cfg.llm_temperature, cfg.llm_max_tokens)
+    llm.check()
+    llm.warmup()
+
+    print(f"[startup] loading speech-to-text ({cfg.stt_model}, {cfg.stt_device})…")
+    stt = WhisperSTT(cfg.stt_model, cfg.stt_device, cfg.stt_compute_type, cfg.stt_threads,
+                     cfg.stt_language, cfg.stt_beam_size, local_only=cfg.strict_offline)
+
+    print("[startup] loading text-to-speech…")
+    tts = make_tts(cfg)
+    print(f"[startup] TTS backend: {tts.backend}")
+
+    speaker = Speaker(tts, SoundDeviceOut(tts.sample_rate, cfg.output_device))
+    print(f"[startup] models ready in {time.time() - t0:.1f}s")
+
+    return OfflineAurobot(
+        cfg, stt=stt, llm=llm, speaker=speaker, mic=MicStream(cfg.input_device),
+        store=MemoryStore(), memory=EmotionMemory(),
+    )
+
+
+def main() -> None:
+    cfg = OfflineConfig.from_env()
+    if cfg.strict_offline:
+        # make accidental network lookups fail loudly instead of silently going online
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    try:
+        bot = build(cfg)
+    except Exception as e:
+        print(f"\n[startup failed] {e}")
+        sys.exit(1)
+    bot.run()
+
+
+if __name__ == "__main__":
+    main()

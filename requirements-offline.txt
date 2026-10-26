@@ -1,0 +1,9 @@
+# Offline core dependencies: local speech pipeline and local Ollama client.
+# Installed into its own venv ("venv_offline") by ./setup_offline.sh
+
+faster-whisper          # local speech-to-text
+piper-tts               # local neural text-to-speech
+webrtcvad-wheels        # voice activity detection (falls back to an energy VAD if missing)
+sounddevice             # mic + speaker (needs: sudo apt install portaudio19-dev libportaudio2)
+requests                # talks to the local Ollama server
+numpy
